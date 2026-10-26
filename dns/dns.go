@@ -76,6 +76,7 @@ func NewName(labels [][]byte) (Name, error) {
 	// Various objects and parameters in the DNS have size limits.
 	//   labels          63 octets or less
 	//   names           255 octets or less
+	encodedLen := 1 // terminating root label
 	for _, label := range labels {
 		if len(label) == 0 {
 			return nil, ErrZeroLengthLabel
@@ -83,11 +84,14 @@ func NewName(labels [][]byte) (Name, error) {
 		if len(label) > 63 {
 			return nil, ErrLabelTooLong
 		}
+		// Saturate once oversized, retaining label-error precedence and
+		// avoiding overflow for arbitrarily long programmatic names.
+		if encodedLen <= 255 {
+			encodedLen += 1 + len(label)
+		}
 	}
-	// Check the total length.
-	builder := newMessageBuilder()
-	builder.WriteName(name)
-	if len(builder.Bytes()) > 255 {
+	// Validation needs the uncompressed length, not a temporary encoding.
+	if encodedLen > 255 {
 		return nil, ErrNameTooLong
 	}
 	return name, nil
@@ -422,43 +426,57 @@ func (builder *messageBuilder) Bytes() []byte {
 }
 
 // WriteName appends name to the in-progress messageBuilder, employing
-// compression pointers to previously written names if possible.
-func (builder *messageBuilder) WriteName(name Name) {
+// compression pointers to previously written names if possible. It returns
+// ErrZeroLengthLabel or ErrLabelTooLong for invalid labels instead of
+// panicking: names reaching the encoder are usually validated by NewName,
+// but a programmatically built Name must not be able to crash the process
+// (notably the server, which encodes names arriving on the wire).
+func (builder *messageBuilder) WriteName(name Name) error {
 	// https://tools.ietf.org/html/rfc1035#section-3.1
 	for i := range name {
 		// Has this suffix already been encoded in the message?
-		if ptr, ok := builder.nameCache[name[i:].String()]; ok && ptr&0x3fff == ptr {
+		suffix := name[i:].String()
+		if ptr, ok := builder.nameCache[suffix]; ok && ptr&0x3fff == ptr {
 			// If so, we can write a compression pointer.
 			binary.Write(&builder.w, binary.BigEndian, uint16(0xc000|ptr))
-			return
+			return nil
 		}
 		// Not cached; we must encode this label verbatim. Store a cache
 		// entry pointing to the beginning of it.
-		builder.nameCache[name[i:].String()] = builder.w.Len()
+		builder.nameCache[suffix] = builder.w.Len()
 		length := len(name[i])
-		if length == 0 || length > 63 {
-			panic(length)
+		if length == 0 {
+			return ErrZeroLengthLabel
+		}
+		if length > 63 {
+			return ErrLabelTooLong
 		}
 		builder.w.WriteByte(byte(length))
 		builder.w.Write(name[i])
 	}
 	builder.w.WriteByte(0)
+	return nil
 }
 
 // WriteQuestion appends a Question section entry to the in-progress
 // messageBuilder.
-func (builder *messageBuilder) WriteQuestion(question *Question) {
+func (builder *messageBuilder) WriteQuestion(question *Question) error {
 	// https://tools.ietf.org/html/rfc1035#section-4.1.2
-	builder.WriteName(question.Name)
+	if err := builder.WriteName(question.Name); err != nil {
+		return err
+	}
 	binary.Write(&builder.w, binary.BigEndian, question.Type)
 	binary.Write(&builder.w, binary.BigEndian, question.Class)
+	return nil
 }
 
 // WriteRR appends a resource record to the in-progress messageBuilder. It
 // returns ErrIntegerOverflow if the length of rr.Data does not fit in 16 bits.
 func (builder *messageBuilder) WriteRR(rr *RR) error {
 	// https://tools.ietf.org/html/rfc1035#section-4.1.3
-	builder.WriteName(rr.Name)
+	if err := builder.WriteName(rr.Name); err != nil {
+		return err
+	}
 	binary.Write(&builder.w, binary.BigEndian, rr.Type)
 	binary.Write(&builder.w, binary.BigEndian, rr.Class)
 	binary.Write(&builder.w, binary.BigEndian, rr.TTL)
@@ -496,7 +514,9 @@ func (builder *messageBuilder) WriteMessage(message *Message) error {
 	// Question section
 	// https://tools.ietf.org/html/rfc1035#section-4.1.2
 	for _, question := range message.Question {
-		builder.WriteQuestion(&question)
+		if err := builder.WriteQuestion(&question); err != nil {
+			return err
+		}
 	}
 
 	// Answer, Authority, and Additional sections
@@ -531,23 +551,30 @@ func (message *Message) WireFormat() ([]byte, error) {
 //
 // https://tools.ietf.org/html/rfc1035#section-3.3.14
 func DecodeRDataTXT(p []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	for {
-		if len(p) == 0 {
-			return nil, io.ErrUnexpectedEOF
-		}
-		n := int(p[0])
-		p = p[1:]
-		if len(p) < n {
-			return nil, io.ErrUnexpectedEOF
-		}
-		buf.Write(p[:n])
-		p = p[n:]
-		if len(p) == 0 {
-			break
-		}
+	if len(p) == 0 {
+		return nil, io.ErrUnexpectedEOF
 	}
-	return buf.Bytes(), nil
+	// Validate and size first, avoiding repeated growth/copying of bundles.
+	size := 0
+	for rest := p; len(rest) > 0; {
+		n := int(rest[0])
+		if len(rest) < n+1 {
+			return nil, io.ErrUnexpectedEOF
+		}
+		size += n
+		rest = rest[n+1:]
+	}
+	if size == 0 {
+		return nil, nil
+	}
+	decoded := make([]byte, size)
+	pos := 0
+	for len(p) > 0 {
+		n := int(p[0])
+		pos += copy(decoded[pos:], p[1:n+1])
+		p = p[n+1:]
+	}
+	return decoded, nil
 }
 
 // EncodeRDataTXT encodes a slice of bytes as TXT-DATA, as appropriate for the
@@ -561,15 +588,21 @@ func EncodeRDataTXT(p []byte) []byte {
 	// TXT data is a sequence of one or more <character-string>s, where
 	// <character-string> is a length octet followed by that number of
 	// octets.
-	var buf bytes.Buffer
+	strings := 1
+	if len(p) > 0 {
+		strings += (len(p) - 1) / 255
+	}
+	encoded := make([]byte, len(p)+strings)
+	pos := 0
 	for len(p) > 255 {
-		buf.WriteByte(255)
-		buf.Write(p[:255])
+		encoded[pos] = 255
+		copy(encoded[pos+1:], p[:255])
+		pos += 256
 		p = p[255:]
 	}
 	// Must write here, even if len(p) == 0, because it's "*one or more*
 	// <character-string>s".
-	buf.WriteByte(byte(len(p)))
-	buf.Write(p)
-	return buf.Bytes()
+	encoded[pos] = byte(len(p))
+	copy(encoded[pos+1:], p)
+	return encoded
 }

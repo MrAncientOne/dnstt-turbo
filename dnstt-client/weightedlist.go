@@ -54,7 +54,7 @@ func parseWeightedList(s string) ([]uint32, []string, error) {
 			if s[i] == '\\' {
 				i++
 				if !(i < len(s)) {
-					return token{Kind: kindError, Text: fmt.Sprintf("%q at end of string", s[i])}
+					return token{Kind: kindError, Text: `backslash at end of string`}
 				}
 			}
 			text.WriteByte(s[i])

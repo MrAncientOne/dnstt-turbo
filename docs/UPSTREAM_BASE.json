@@ -1,0 +1,6 @@
+{
+  "repository": "https://www.bamsoftware.com/git/dnstt.git",
+  "version": "v1.20260501.0",
+  "commit": "0c5c52a57d899c05428c116898941761a2ed83c2",
+  "scope": "Canonical Git ancestry; tested turbo Go source and module files preserved during transplant"
+}

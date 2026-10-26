@@ -142,21 +142,36 @@ func (s *Session) OpenStream() (*Stream, error) {
 
 	stream := newStream(sid, s.config.MaxFrameSize, s)
 
+	// Register before SYN is visible to the peer. Its first PSH/UPD/FIN may
+	// arrive before the local SYN Write returns (e.g. a descheduled writer).
+	// The receive loop otherwise silently discards that response.
+	s.streamLock.Lock()
+	if s.IsClosed() {
+		s.streamLock.Unlock()
+		return nil, io.ErrClosedPipe
+	}
+	s.streams[sid] = stream
+	s.streamLock.Unlock()
+	discard := func() {
+		stream.sessionClose()
+		s.streamClosed(sid)
+	}
 	if _, err := s.writeFrame(newFrame(byte(s.config.Version), cmdSYN, sid)); err != nil {
+		discard()
 		return nil, err
 	}
 
-	s.streamLock.Lock()
-	defer s.streamLock.Unlock()
 	select {
 	case <-s.chSocketReadError:
+		discard()
 		return nil, s.socketReadError.Load().(error)
 	case <-s.chSocketWriteError:
+		discard()
 		return nil, s.socketWriteError.Load().(error)
 	case <-s.die:
+		discard()
 		return nil, io.ErrClosedPipe
 	default:
-		s.streams[sid] = stream
 		return stream, nil
 	}
 }

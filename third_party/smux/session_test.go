@@ -288,20 +288,66 @@ func TestWriteToV2(t *testing.T) {
 }
 
 func TestGetDieCh(t *testing.T) {
-	cs, ss, err := getSmuxStreamPair()
+	// Use real sessions over an in-memory carrier so the close contract does
+	// not depend on TCP listener availability or an unjoined helper goroutine.
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() { c1.Close() })
+	t.Cleanup(func() { c2.Close() })
+	client, err := Client(c1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ss.Close()
-	dieCh := ss.GetDieCh()
-	go func() {
-		select {
-		case <-dieCh:
-		case <-time.Tick(time.Second):
-			t.Fatal("wait die chan timeout")
-		}
-	}()
-	cs.Close()
+	t.Cleanup(func() { client.Close() })
+	server, err := Server(c2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.Close() })
+	cs, err := client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ss, err := server.AcceptStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dieCh := cs.GetDieCh()
+	select {
+	case <-dieCh:
+		t.Fatal("local close channel closed before Close")
+	default:
+	}
+	if err := cs.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-dieCh:
+	default:
+		t.Fatal("local close channel still open after Close")
+	}
+
+	// A peer FIN signals EOF independently of the receiver's local Close.
+	if err := ss.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var buf [1]byte
+	if n, err := ss.Read(buf[:]); n != 0 || err != io.EOF {
+		t.Fatalf("read after peer Close = (%d, %v), want (0, EOF)", n, err)
+	}
+	select {
+	case <-ss.GetDieCh():
+		t.Fatal("peer FIN closed the receiver's local close channel")
+	default:
+	}
+	if err := ss.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ss.GetDieCh():
+	default:
+		t.Fatal("receiver's local close channel still open after Close")
+	}
 }
 
 func TestSpeed(t *testing.T) {

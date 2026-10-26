@@ -1,0 +1,91 @@
+name: Build latest binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish/update the latest release and move its latest tag to this commit'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-latest
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Releases are built from the default branch, not a pull-request checkout.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - run: go mod download
+      - run: make check
+      - run: make race
+      - run: make release
+      - name: Verify artifacts
+        run: sha256sum -c SHA256SUMS
+        working-directory: dist/latest
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: latest
+          path: dist/latest/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Prepare release notes
+        if: inputs.publish
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path('dist/latest')
+          info = json.loads((root / 'BUILD_INFO.json').read_text())
+          notes = (
+              'Source commit: `' + os.environ['SOURCE_SHA'] + '`\n\n'
+              'Compiler: `' + info['compiler'] + '`\n\n'
+              'Download the archive matching your platform and role. '
+              'Binary names are stable; identify builds by SHA256.\n\n'
+              '```text\n' + (root / 'SHA256SUMS').read_text() + '```\n'
+          )
+          Path('build').mkdir(exist_ok=True)
+          Path('build/release-notes.md').write_text(notes)
+          PY
+      - name: Publish latest
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GH_REPO/git/ref/tags/latest" --silent; then
+            gh api --method PATCH "repos/$GH_REPO/git/refs/tags/latest" \
+              -f sha="$SOURCE_SHA" -F force=true --silent
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f ref=refs/tags/latest -f sha="$SOURCE_SHA" --silent
+          fi
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest dist/latest/* --clobber
+            gh release edit latest --title latest --draft=false --latest \
+              --notes-file build/release-notes.md
+          else
+            gh release create latest dist/latest/* --verify-tag --title latest \
+              --latest --notes-file build/release-notes.md
+          fi

@@ -197,7 +197,7 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 		0, // default resend
 		1, // nc=1 => congestion window off
 	)
-	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
+	conn.SetWindowSize(turbotunnel.GetQueueSize()/2, turbotunnel.GetQueueSize()/2)
 	if rc := conn.SetMtu(mtu); !rc {
 		panic(rc)
 	}

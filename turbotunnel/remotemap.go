@@ -32,6 +32,13 @@ type RemoteMap struct {
 	lock sync.Mutex
 }
 
+// Limits apply independently of the configured KCP window. Polls may carry
+// arbitrary unauthenticated IDs; neither IDs nor queue storage may grow
+// without bound. Exhaustion drops new peers' datagrams, like a full queue,
+// without evicting an established peer's pending data.
+const maxRemoteRecords = 1024
+const maxRemoteQueueSlots = 262144
+
 // NewRemoteMap creates a RemoteMap that expires peers after a timeout.
 //
 // If the timeout is 0, peers never expire.
@@ -68,7 +75,27 @@ func NewRemoteMap(timeout time.Duration) *RemoteMap {
 func (m *RemoteMap) SendQueue(addr net.Addr) chan []byte {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	return m.inner.Lookup(addr, time.Now()).SendQueue
+	r := m.inner.Lookup(addr, time.Now())
+	if r == nil {
+		return nil
+	}
+	return r.SendQueue
+}
+
+// ExistingQueues returns queues only if outbound data already created a peer.
+// In particular, an empty unauthenticated poll must allocate no remote state.
+// A nil channel is safe to use in a select alongside a timeout or new query.
+func (m *RemoteMap) ExistingQueues(addr net.Addr) (<-chan []byte, <-chan []byte) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	i, ok := m.inner.byAddr[addr]
+	if !ok {
+		return nil, nil
+	}
+	r := m.inner.byAge[i]
+	r.LastSeen = time.Now()
+	heap.Fix(&m.inner, i)
+	return r.SendQueue, r.Stash
 }
 
 // Stash places p in the stash corresponding to addr, if the stash is not
@@ -77,8 +104,12 @@ func (m *RemoteMap) SendQueue(addr net.Addr) chan []byte {
 func (m *RemoteMap) Stash(addr net.Addr, p []byte) bool {
 	m.lock.Lock()
 	defer m.lock.Unlock()
+	r := m.inner.Lookup(addr, time.Now())
+	if r == nil {
+		return false
+	}
 	select {
-	case m.inner.Lookup(addr, time.Now()).Stash <- p:
+	case r.Stash <- p:
 		return true
 	default:
 		return false
@@ -89,7 +120,11 @@ func (m *RemoteMap) Stash(addr net.Addr, p []byte) bool {
 func (m *RemoteMap) Unstash(addr net.Addr) <-chan []byte {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	return m.inner.Lookup(addr, time.Now()).Stash
+	r := m.inner.Lookup(addr, time.Now())
+	if r == nil {
+		return nil
+	}
+	return r.Stash
 }
 
 // remoteMapInner is the inner type of RemoteMap, implementing heap.Interface.
@@ -98,16 +133,25 @@ func (m *RemoteMap) Unstash(addr net.Addr) <-chan []byte {
 // allow looking up by address. Unlike RemoteMap, remoteMapInner requires
 // external synchonization.
 type remoteMapInner struct {
-	byAge  []*remoteRecord
-	byAddr map[net.Addr]int
+	byAge      []*remoteRecord
+	byAddr     map[net.Addr]int
+	queueSlots int
 }
 
 // removeExpired removes all records whose LastSeen timestamp is more than
-// timeout in the past.
+// timeout in the past. Dropped records are simply forgotten (their channels
+// are garbage-collected): they are deliberately NOT closed. Closing the
+// send queue here races with a concurrent Lookup+send on another goroutine
+// (Lookup returns the channel under the lock, the send happens after it),
+// and sending on a closed channel panics — a whole-process crash from a
+// microsecond interleaving on an idle-timeout path. All in-repo receivers
+// either re-fetch the queue every iteration (send loops) or select with a
+// timer/channel wakeup alongside the receive, so an abandoned queue can
+// neither wedge nor leak a goroutine; queued-but-unsent packets are
+// dropped, which is the documented expiry semantic.
 func (inner *remoteMapInner) removeExpired(now time.Time, timeout time.Duration) {
 	for len(inner.byAge) > 0 && now.Sub(inner.byAge[0].LastSeen) >= timeout {
-		record := heap.Pop(inner).(*remoteRecord)
-		close(record.SendQueue)
+		heap.Pop(inner)
 	}
 }
 
@@ -123,11 +167,15 @@ func (inner *remoteMapInner) Lookup(addr net.Addr, now time.Time) *remoteRecord 
 		record.LastSeen = now
 		heap.Fix(inner, i)
 	} else {
+		size := GetQueueSize()
+		if len(inner.byAddr) >= maxRemoteRecords || size > maxRemoteQueueSlots-inner.queueSlots {
+			return nil
+		}
 		// Not found, create a new one.
 		record = &remoteRecord{
 			Addr:      addr,
 			LastSeen:  now,
-			SendQueue: make(chan []byte, QueueSize),
+			SendQueue: make(chan []byte, size),
 			Stash:     make(chan []byte, 1),
 		}
 		heap.Push(inner, record)
@@ -163,6 +211,7 @@ func (inner *remoteMapInner) Push(x interface{}) {
 	inner.byAddr[record.Addr] = len(inner.byAge)
 	// Insert into byAge slice.
 	inner.byAge = append(inner.byAge, record)
+	inner.queueSlots += cap(record.SendQueue)
 }
 
 func (inner *remoteMapInner) Pop() interface{} {
@@ -173,5 +222,6 @@ func (inner *remoteMapInner) Pop() interface{} {
 	inner.byAge = inner.byAge[:n-1]
 	// Remove from byAddr map.
 	delete(inner.byAddr, record.Addr)
+	inner.queueSlots -= cap(record.SendQueue)
 	return record
 }

@@ -48,7 +48,7 @@ func NewQueuePacketConn(localAddr net.Addr, timeout time.Duration) *QueuePacketC
 	return &QueuePacketConn{
 		remotes:   NewRemoteMap(timeout),
 		localAddr: localAddr,
-		recvQueue: make(chan taggedPacket, QueueSize),
+		recvQueue: make(chan taggedPacket, GetQueueSize()),
 		closed:    make(chan struct{}),
 	}
 }
@@ -77,6 +77,12 @@ func (c *QueuePacketConn) QueueIncoming(p []byte, addr net.Addr) {
 // written to the address in question using WriteTo.
 func (c *QueuePacketConn) OutgoingQueue(addr net.Addr) <-chan []byte {
 	return c.remotes.SendQueue(addr)
+}
+
+// ExistingQueues inspects pending outbound data without creating a peer for
+// an unauthenticated poll. Nil channels mean no outbound state exists yet.
+func (c *QueuePacketConn) ExistingQueues(addr net.Addr) (<-chan []byte, <-chan []byte) {
+	return c.remotes.ExistingQueues(addr)
 }
 
 // Stash places p in the stash for addr, if the stash is not already occupied.
@@ -111,9 +117,16 @@ func (c *QueuePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 // WriteTo queues an outgoing packet for the given address. The queue can later
 // be retrieved using the OutgoingQueue method.
 func (c *QueuePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	n, _, err := c.TryWriteTo(p, addr)
+	return n, err
+}
+
+// TryWriteTo also reports whether the bounded queue accepted the packet.
+// WriteTo retains datagram semantics: a full queue drops without an error.
+func (c *QueuePacketConn) TryWriteTo(p []byte, addr net.Addr) (int, bool, error) {
 	select {
 	case <-c.closed:
-		return 0, &net.OpError{Op: "write", Net: c.LocalAddr().Network(), Addr: c.LocalAddr(), Err: c.err.Load().(error)}
+		return 0, false, &net.OpError{Op: "write", Net: c.LocalAddr().Network(), Addr: c.LocalAddr(), Err: c.err.Load().(error)}
 	default:
 	}
 	// Copy the slice so that the caller may reuse it.
@@ -121,10 +134,10 @@ func (c *QueuePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	copy(buf, p)
 	select {
 	case c.remotes.SendQueue(addr) <- buf:
-		return len(buf), nil
+		return len(buf), true, nil
 	default:
 		// Drop the outgoing packet if the send queue is full.
-		return len(buf), nil
+		return len(buf), false, nil
 	}
 }
 
@@ -153,6 +166,10 @@ func (c *QueuePacketConn) closeWithError(err error) error {
 func (c *QueuePacketConn) Close() error {
 	return c.closeWithError(nil)
 }
+
+// Done is closed when the connection is closed, including for queue consumers.
+// Outgoing queues are deliberately not closed because producers may race Close.
+func (c *QueuePacketConn) Done() <-chan struct{} { return c.closed }
 
 // LocalAddr returns the localAddr value that was passed to NewQueuePacketConn.
 func (c *QueuePacketConn) LocalAddr() net.Addr { return c.localAddr }

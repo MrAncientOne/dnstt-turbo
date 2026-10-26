@@ -1,0 +1,48 @@
+package fairqueue
+
+import (
+ "testing"
+ "sync/atomic"
+ "time"
+)
+
+// Production calls SetRate every100ms while a slow flow remains queued.
+// Reapplying the same rate must not forgive debt for bytes already admitted.
+func TestAuditSetRatePreservesPendingSerializationDebt(t *testing.T) {
+ s := NewScheduler(Config{Chunk:4096, RateBps:1024, Reliable:true})
+ defer s.Close()
+ now := time.Now()
+ s.mu.Lock()
+ s.shaper.IdleReset(now)
+ s.shaper.Advance(4096, now, false)
+ before := s.shaper.Wait(now)
+ s.mu.Unlock()
+ if before < time.Second { t.Fatalf("fixture debt too small: %v",before) }
+ s.SetRate(1024,100*time.Millisecond)
+ s.mu.Lock()
+ after := s.shaper.Wait(now)
+ s.mu.Unlock()
+ t.Logf("pending wait before same-rate update=%v after=%v",before,after)
+ if after < before/2 { t.Fatalf("same-rate update erased serialization debt: before=%v after=%v",before,after) }
+}
+
+
+type auditShaperWriter struct { events chan time.Time; count atomic.Int32 }
+func (w *auditShaperWriter) SetWriteDeadline(time.Time) error { return nil }
+func (w *auditShaperWriter) Write(p []byte) (int,error) { w.count.Add(1); w.events <- time.Now(); return len(p),nil }
+
+func TestAuditLiveRateUpdateDoesNotReleaseQueuedChunkEarly(t *testing.T) {
+ s := NewScheduler(Config{Chunk:4096,RateBps:1024,Reliable:true})
+ defer s.Close()
+ w:= &auditShaperWriter{events:make(chan time.Time,4)}
+ f:=s.AddFlow(w)
+ go s.Run()
+ done:=make(chan error,1)
+ go func(){ for i:=0;i<2;i++ {if err:=s.Submit(f,make([]byte,4096));err!=nil{done<-err;return}}; done<-nil }()
+ select {case <-w.events:case <-time.After(time.Second):t.Fatal("first chunk not delivered")}
+ deadline:=time.Now().Add(time.Second)
+ for s.QueuedLen()==0 {if time.Now().After(deadline){t.Fatal("second chunk not queued")};time.Sleep(time.Millisecond)}
+ select {case <-w.events:t.Fatal("fixture shaper did not initially gate second chunk");default:}
+ s.SetRate(1024,100*time.Millisecond)
+ select {case <-w.events:t.Fatalf("same-rate update released second 4096-byte chunk immediately at 1024B/s; count=%d",w.count.Load());case <-time.After(100*time.Millisecond):}
+}

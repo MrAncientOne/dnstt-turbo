@@ -1,2 +1,28 @@
-dnstt-client/dnstt-client
-dnstt-server/dnstt-server
+# Generated binaries, releases, simulator runs and profiles.
+/build/
+/dist/
+/bin/
+/dnstt-client/dnstt-client
+/dnstt-server/dnstt-server
+*.test
+*.pprof
+coverage.out
+
+# Local credentials and operational artifacts.
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+*.log
+*.pcap
+*.pcapng
+
+# Editor and Python caches.
+__pycache__/
+*.py[cod]
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/

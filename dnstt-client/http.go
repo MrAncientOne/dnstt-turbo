@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -28,6 +29,8 @@ const defaultRetryAfter = 10 * time.Second
 //
 // https://tools.ietf.org/html/rfc8484
 type HTTPPacketConn struct {
+	ctx    context.Context
+	cancel context.CancelFunc
 	// client is the http.Client used to make requests. We use this instead
 	// of http.DefaultClient in order to support setting a timeout and a
 	// uTLS fingerprint.
@@ -60,7 +63,9 @@ type HTTPPacketConn struct {
 // path components; e.g., "/dns-query". numSenders is the number of concurrent
 // sender-receiver goroutines to run.
 func NewHTTPPacketConn(rt http.RoundTripper, urlString string, numSenders int) (*HTTPPacketConn, error) {
+	ctx, cancel := context.WithCancel(context.Background())
 	c := &HTTPPacketConn{
+		ctx: ctx, cancel: cancel,
 		client: &http.Client{
 			Transport: rt,
 			Timeout:   1 * time.Minute,
@@ -77,7 +82,11 @@ func NewHTTPPacketConn(rt http.RoundTripper, urlString string, numSenders int) (
 // send sends a message in an HTTP request, and queues the body HTTP response to
 // be returned from a future call to ReadFrom.
 func (c *HTTPPacketConn) send(p []byte) error {
-	req, err := http.NewRequest("POST", c.urlString, bytes.NewReader(p))
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", c.urlString, bytes.NewReader(p))
 	if err != nil {
 		return err
 	}
@@ -142,7 +151,13 @@ func (c *HTTPPacketConn) send(p []byte) error {
 // sendLoop loops over the contents of the outgoing queue and passes them to
 // send. It drops packets while c.notBefore is in the future.
 func (c *HTTPPacketConn) sendLoop() {
-	for p := range c.QueuePacketConn.OutgoingQueue(turbotunnel.DummyAddr{}) {
+	for {
+		var p []byte
+		select {
+		case <-c.Done():
+			return
+		case p = <-c.QueuePacketConn.OutgoingQueue(turbotunnel.DummyAddr{}):
+		}
 		// Stop sending while we are rate-limiting ourselves (as a
 		// result of a Retry-After response header, for example).
 		c.notBeforeLock.RLock()
@@ -173,4 +188,12 @@ func parseRetryAfter(value string, now time.Time) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return now.Add(time.Duration(i) * time.Second), nil
+}
+
+func (c *HTTPPacketConn) Close() error {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	c.client.CloseIdleConnections()
+	return c.QueuePacketConn.Close()
 }

@@ -26,6 +26,9 @@ const dialTimeout = 30 * time.Second
 //
 // https://tools.ietf.org/html/rfc7858
 type TLSPacketConn struct {
+	mu     sync.Mutex
+	conn   net.Conn
+	cancel context.CancelFunc
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
@@ -37,8 +40,9 @@ type TLSPacketConn struct {
 // the resolver, reconnecting as necessary. It closes the connection if any
 // reconnection attempt fails.
 func NewTLSPacketConn(addr string, dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)) (*TLSPacketConn, error) {
+	ctx, cancel := context.WithCancel(context.Background())
 	dial := func() (net.Conn, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+		ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 		defer cancel()
 		return dialTLSContext(ctx, "tcp", addr)
 	}
@@ -48,29 +52,36 @@ func NewTLSPacketConn(addr string, dialTLSContext func(ctx context.Context, netw
 	// reported directly to the caller of NewTLSPacketConn.
 	conn, err := dial()
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	c := &TLSPacketConn{
+		conn: conn, cancel: cancel,
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 0),
 	}
 	go func() {
 		defer c.Close()
 		for {
+			ended := make(chan struct{})
+			var endOnce sync.Once
+			end := func() { endOnce.Do(func() { close(ended); conn.Close() }) }
 			var wg sync.WaitGroup
 			wg.Add(2)
 			go func() {
+				defer wg.Done()
+				defer end()
 				err := c.recvLoop(conn)
 				if err != nil {
 					log.Printf("recvLoop: %v", err)
 				}
-				wg.Done()
 			}()
 			go func() {
-				err := c.sendLoop(conn)
+				defer wg.Done()
+				defer end()
+				err := c.sendLoop(conn, ended)
 				if err != nil {
 					log.Printf("sendLoop: %v", err)
 				}
-				wg.Done()
 			}()
 			wg.Wait()
 			conn.Close()
@@ -81,6 +92,16 @@ func NewTLSPacketConn(addr string, dialTLSContext func(ctx context.Context, netw
 				log.Printf("dial tls: %v", err)
 				break
 			}
+			c.mu.Lock()
+			select {
+			case <-c.Done():
+				c.mu.Unlock()
+				conn.Close()
+				return
+			default:
+			}
+			c.conn = conn
+			c.mu.Unlock()
 		}
 	}()
 	return c, nil
@@ -110,12 +131,23 @@ func (c *TLSPacketConn) recvLoop(conn net.Conn) error {
 
 // sendLoop reads messages from the outgoing queue and writes them,
 // length-prefixed, to conn.
-func (c *TLSPacketConn) sendLoop(conn net.Conn) error {
+func (c *TLSPacketConn) sendLoop(conn net.Conn, ended <-chan struct{}) error {
 	bw := bufio.NewWriter(conn)
-	for p := range c.QueuePacketConn.OutgoingQueue(turbotunnel.DummyAddr{}) {
+	for {
+		var p []byte
+		select {
+		case <-c.Done():
+			return net.ErrClosed
+		case <-ended:
+			return net.ErrClosed
+		case p = <-c.QueuePacketConn.OutgoingQueue(turbotunnel.DummyAddr{}):
+		}
 		length := uint16(len(p))
 		if int(length) != len(p) {
-			panic(len(p))
+			// Cannot frame it; drop so one oversize packet can't kill
+			// the transport loop (KCP retransmits in smaller pieces).
+			log.Printf("sendLoop: dropping %d-byte packet, exceeds DNS-over-TLS framing", len(p))
+			continue
 		}
 		err := binary.Write(bw, binary.BigEndian, &length)
 		if err != nil {
@@ -129,6 +161,16 @@ func (c *TLSPacketConn) sendLoop(conn net.Conn) error {
 		if err != nil {
 			return err
 		}
+	}
+}
+
+func (c *TLSPacketConn) Close() error {
+	c.cancel()
+	c.QueuePacketConn.Close()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil {
+		return c.conn.Close()
 	}
 	return nil
 }

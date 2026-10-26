@@ -153,9 +153,11 @@ func TestUnexpectedPayload(t *testing.T) {
 		// Fake a client side that sends a payload.
 		go func() {
 			defer c.Close()
-			err := clientWithPayload(c)
-			if err != nil {
-				t.Fatal(err)
+			// t.Error, not t.Fatal: FailNow/Fatal/SkipNow must only run
+			// on the test goroutine (vet flags this); the failure still
+			// fails the test.
+			if err := clientWithPayload(c); err != nil {
+				t.Error(err)
 			}
 		}()
 
@@ -204,9 +206,9 @@ func TestUnexpectedPayload(t *testing.T) {
 		// Fake a server side that sends a payload.
 		go func() {
 			defer s.Close()
-			err := serverWithPayload(s)
-			if err != nil {
-				t.Fatal(err)
+			// t.Error, not t.Fatal: see above.
+			if err := serverWithPayload(s); err != nil {
+				t.Error(err)
 			}
 		}()
 

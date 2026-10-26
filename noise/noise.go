@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/flynn/noise"
 	"golang.org/x/crypto/curve25519"
@@ -52,11 +53,19 @@ func writeMessage(w io.Writer, msg []byte) error {
 	if int(length) != len(msg) {
 		panic(len(msg))
 	}
-	err := binary.Write(w, binary.BigEndian, length)
+	var prefix [2]byte
+	binary.BigEndian.PutUint16(prefix[:], length)
+	n, err := w.Write(prefix[:])
 	if err != nil {
 		return err
 	}
-	_, err = w.Write(msg)
+	if n != len(prefix) {
+		return io.ErrShortWrite
+	}
+	n, err = w.Write(msg)
+	if err == nil && n != len(msg) {
+		err = io.ErrShortWrite
+	}
 	return err
 }
 
@@ -65,16 +74,29 @@ func writeMessage(w io.Writer, msg []byte) error {
 type socket struct {
 	recvPipe   *io.PipeReader
 	sendCipher *noise.CipherState
+	// wmu serializes Write: CipherState.Encrypt advances the nonce on
+	// every call and is not goroutine-safe, so two concurrent Writes
+	// would reuse a (key, nonce) pair (keystream reuse: confidentiality
+	// and authenticity loss for both records) and interleave frames.
+	// Today's only writer (one smux session's shaper loop) is already
+	// serial, but the cost of the guarantee here is one uncontended
+	// mutex, and the cost of relying on the caller is catastrophic.
+	wmu         sync.Mutex
+	closeOnce   sync.Once
+	done        chan struct{}
+	terminalErr error // published by closing done
 	io.ReadWriteCloser
 }
 
 func newSocket(rwc io.ReadWriteCloser, recvCipher, sendCipher *noise.CipherState) *socket {
 	pr, pw := io.Pipe()
+	s := &socket{sendCipher: sendCipher, recvPipe: pr, ReadWriteCloser: rwc, done: make(chan struct{})}
 	// This loop calls readMessage, decrypts the messages, and feeds them
 	// into recvPipe where they will be returned from Read.
 	go func() (err error) {
 		defer func() {
 			pw.CloseWithError(err)
+			s.fail(err)
 		}()
 		for {
 			msg, err := readMessage(rwc)
@@ -91,11 +113,29 @@ func newSocket(rwc io.ReadWriteCloser, recvCipher, sendCipher *noise.CipherState
 			}
 		}
 	}()
-	return &socket{
-		sendCipher:      sendCipher,
-		recvPipe:        pr,
-		ReadWriteCloser: rwc,
-	}
+	return s
+}
+
+// An encrypted record cannot be resumed after a partial write or an integrity
+// failure. The cipher nonce has advanced; continuing would desynchronize every
+// later record. Close the transport and notify session owners immediately.
+func (s *socket) fail(err error) {
+	s.closeOnce.Do(func() {
+		if err == nil {
+			err = io.ErrClosedPipe
+		}
+		s.terminalErr = err
+		close(s.done)
+		s.ReadWriteCloser.Close()
+	})
+}
+
+func (s *socket) Done() <-chan struct{} { return s.done }
+
+func (s *socket) Close() error {
+	s.fail(io.ErrClosedPipe)
+	s.recvPipe.Close()
+	return nil
 }
 
 // Read reads decrypted data from the wrapped io.Reader.
@@ -105,6 +145,13 @@ func (s *socket) Read(p []byte) (int, error) {
 
 // Write writes encrypted data from the wrapped io.Writer.
 func (s *socket) Write(p []byte) (int, error) {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	select {
+	case <-s.done:
+		return 0, s.terminalErr
+	default:
+	}
 	total := 0
 	for len(p) > 0 {
 		n := len(p)
@@ -113,10 +160,12 @@ func (s *socket) Write(p []byte) (int, error) {
 		}
 		msg, err := s.sendCipher.Encrypt(nil, nil, p[:n])
 		if err != nil {
+			s.fail(err)
 			return total, err
 		}
 		err = writeMessage(s.ReadWriteCloser, msg)
 		if err != nil {
+			s.fail(err)
 			return total, err
 		}
 		total += n

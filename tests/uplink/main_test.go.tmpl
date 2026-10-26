@@ -1,0 +1,661 @@
+package controlled
+
+import (
+	"bytes"
+	"controlled/client"
+	"controlled/server"
+	"crypto/ed25519"
+	crand "crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"io"
+	"math/big"
+	"math/rand"
+	"net"
+	"os"
+	"sort"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+	"www.bamsoftware.com/git/dnstt.git/noise"
+	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+)
+
+type packet struct {
+	b     []byte
+	due   time.Time
+	owner *carrier
+}
+type carrier struct {
+	in, out   chan packet
+	done      chan struct{}
+	once      sync.Once
+	mu        sync.Mutex
+	finish    time.Time
+	rate      float64
+	delay     time.Duration
+	count     atomic.Int64
+	start     time.Time
+	profile   string
+	lastDue   time.Time
+	loss      int64
+	duplicate int64
+	burst     int64
+	wire      atomic.Int64
+	peak      atomic.Int64
+	qmu       sync.Mutex
+	queued    int64
+	budget    int64
+	space     chan struct{}
+	direction string
+}
+
+func (c *carrier) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case <-c.done:
+		return 0, nil, net.ErrClosed
+	case q := <-c.in:
+		timer := time.NewTimer(time.Until(q.due))
+		defer timer.Stop()
+		select {
+		case <-c.done:
+			return 0, nil, net.ErrClosed
+		case <-timer.C:
+		}
+		if q.owner != nil {
+			q.owner.release(int64(len(q.b) + 2))
+		}
+		return copy(p, q.b), turbotunnel.DummyAddr{}, nil
+	}
+}
+func (c *carrier) WriteTo(p []byte, _ net.Addr) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if c.finish.Before(now) {
+		c.finish = now
+	}
+	size := int64(len(p) + 2)
+	if err := c.reserve(size); err != nil {
+		return 0, err
+	}
+	held := true
+	defer func() {
+		if held {
+			c.release(size)
+		}
+	}()
+	if now := time.Now(); c.finish.Before(now) {
+		c.finish = now
+	}
+	c.wire.Add(size)
+	remaining := float64(size)
+	for remaining > 0 {
+		rate := c.rate
+		boundary := c.finish.Add(time.Hour)
+		elapsed := c.finish.Sub(c.start)
+		if c.profile == "variable" || c.profile == "outage" || c.profile == "long-outage" {
+			recovery := 5 * time.Second
+			if c.profile == "long-outage" {
+				recovery = 12 * time.Second
+			}
+			if elapsed < 2*time.Second {
+				boundary = c.start.Add(2 * time.Second)
+			} else if elapsed < recovery {
+				boundary = c.start.Add(recovery)
+				rate = c.rate / 10
+				if c.profile == "outage" || c.profile == "long-outage" {
+					rate = 0
+				}
+			}
+		}
+		if c.profile == "cellular" {
+			cycle := 6 * time.Second
+			phase := elapsed % cycle
+			base := c.finish.Add(-phase)
+			if phase < 2*time.Second {
+				boundary = base.Add(2 * time.Second)
+			} else if phase < 4*time.Second {
+				rate = c.rate / 8
+				boundary = base.Add(4 * time.Second)
+			} else if phase < 4500*time.Millisecond {
+				rate = 0
+				boundary = base.Add(4500 * time.Millisecond)
+			} else {
+				boundary = base.Add(cycle)
+			}
+		}
+		if c.profile == "contention" && elapsed >= 2*time.Second && elapsed < 6*time.Second {
+			rate = c.rate / 4
+			boundary = c.start.Add(6 * time.Second)
+		} else if c.profile == "contention" && elapsed < 2*time.Second {
+			boundary = c.start.Add(2 * time.Second)
+		}
+		// A fast uplink collapses for long enough to exercise controller
+		// downshift and admission-shaper hysteresis, then recovers.
+		if c.profile == "capacity-drop" {
+			if elapsed < 3*time.Second {
+				boundary = c.start.Add(3*time.Second)
+			} else if elapsed < 15*time.Second {
+				rate = c.rate/100
+				boundary = c.start.Add(15*time.Second)
+			}
+		}
+		if rate == 0 {
+			c.finish = boundary
+			continue
+		}
+		available := boundary.Sub(c.finish).Seconds() * rate
+		if remaining <= available {
+			c.finish = c.finish.Add(time.Duration(remaining / rate * float64(time.Second)))
+			remaining = 0
+		} else {
+			remaining -= available
+			c.finish = boundary
+		}
+	}
+	n := c.count.Add(1)
+	due := c.finish.Add(c.delay)
+	// TCP retransmission produces a delivery blackout and head-of-line blocking.
+	if c.profile == "tcp-loss" && n%37 == 0 {
+		due = due.Add(250 * time.Millisecond)
+	}
+	if c.profile == "ack-compression" && c.direction == "down" {
+		quantum := 100 * time.Millisecond
+		elapsed := due.Sub(c.start)
+		due = c.start.Add((elapsed/quantum + 1) * quantum)
+	}
+	if c.profile == "jitter" {
+		due = due.Add(time.Duration((n*37)%81) * time.Millisecond)
+	}
+	if due.Before(c.lastDue) {
+		due = c.lastDue
+	}
+	c.lastDue = due
+	if c.loss > 0 && (n-1)%c.loss >= c.loss-max(c.burst, 1) {
+		return len(p), nil
+	}
+	q := packet{b: append([]byte(nil), p...), due: due, owner: c}
+	select {
+	case <-c.done:
+		return 0, net.ErrClosed
+	case c.out <- q:
+		held = false
+	}
+	if c.duplicate > 0 && n%c.duplicate == 0 {
+		if err := c.reserve(size); err != nil {
+			return 0, err
+		}
+		c.wire.Add(size)
+		select {
+		case <-c.done:
+			c.release(size)
+			return 0, net.ErrClosed
+		case c.out <- q:
+		}
+	}
+	return len(p), nil
+}
+
+// reserve limits queued wire bytes; backpressure models a finite TCP send buffer.
+func (c *carrier) reserve(n int64) error {
+	if c.budget <= 0 {
+		return nil
+	}
+	if n > c.budget {
+		return fmt.Errorf("frame %d exceeds queue budget %d", n, c.budget)
+	}
+	c.qmu.Lock()
+	defer c.qmu.Unlock()
+	for c.queued+n > c.budget {
+		space := c.space
+		c.qmu.Unlock()
+		select {
+		case <-c.done:
+			c.qmu.Lock()
+			return net.ErrClosed
+		case <-space:
+		}
+		c.qmu.Lock()
+	}
+	c.queued += n
+	for old := c.peak.Load(); c.queued > old; old = c.peak.Load() {
+		if c.peak.CompareAndSwap(old, c.queued) {
+			break
+		}
+	}
+	return nil
+}
+func (c *carrier) release(n int64) {
+	if c.budget <= 0 {
+		return
+	}
+	c.qmu.Lock()
+	c.queued -= n
+	close(c.space)
+	c.space = make(chan struct{})
+	c.qmu.Unlock()
+}
+func envInt(name string, fallback int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return fallback
+	}
+	n, e := strconv.Atoi(v)
+	if e != nil || n < 0 {
+		panic("invalid " + name)
+	}
+	return n
+}
+func payloadFor(index, size int) []byte {
+	p := make([]byte, size)
+	rand.New(rand.NewSource(int64(42 + index))).Read(p)
+	return p
+}
+
+func (c *carrier) Close() error                     { c.once.Do(func() { close(c.done) }); return nil }
+func (c *carrier) LocalAddr() net.Addr              { return turbotunnel.DummyAddr{} }
+func (c *carrier) Reliable() bool                   { return true }
+func (c *carrier) SetDeadline(time.Time) error      { return nil }
+func (c *carrier) SetReadDeadline(time.Time) error  { return nil }
+func (c *carrier) SetWriteDeadline(time.Time) error { return nil }
+
+type half struct{ net.Conn }
+
+func (c half) CloseRead() error  { return nil }
+func (c half) CloseWrite() error { return nil }
+
+type listener struct {
+	ch   chan net.Conn
+	done chan struct{}
+	once sync.Once
+}
+
+func (l *listener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.ch:
+		return c, nil
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+func (l *listener) Close() error   { l.once.Do(func() { close(l.done) }); return nil }
+func (l *listener) Addr() net.Addr { return turbotunnel.DummyAddr{} }
+
+func makePair() (*carrier, *carrier) {
+	up, down := make(chan packet, envInt("QUEUE_PACKETS", 256)), make(chan packet, envInt("QUEUE_PACKETS", 256))
+	rate := 1250000.0
+	delay := 20 * time.Millisecond
+	if v := os.Getenv("RATE"); v != "" {
+		rate, _ = strconv.ParseFloat(v, 64)
+	}
+	if v := os.Getenv("DELAY_MS"); v != "" {
+		n, _ := strconv.Atoi(v)
+		delay = time.Duration(n) * time.Millisecond
+	}
+	upRate, downRate := rate, rate
+	if v := os.Getenv("UP_RATE"); v != "" {
+		upRate, _ = strconv.ParseFloat(v, 64)
+	}
+	if v := os.Getenv("DOWN_RATE"); v != "" {
+		downRate, _ = strconv.ParseFloat(v, 64)
+	}
+	started := time.Now()
+	loss, duplicate := int64(0), int64(0)
+	if v := os.Getenv("LOSS_EVERY"); v != "" {
+		loss, _ = strconv.ParseInt(v, 10, 64)
+	}
+	if v := os.Getenv("DUP_EVERY"); v != "" {
+		duplicate, _ = strconv.ParseInt(v, 10, 64)
+	}
+	a := &carrier{in: down, out: up, done: make(chan struct{}), rate: upRate, delay: delay, start: started, profile: os.Getenv("PROFILE"), loss: loss, duplicate: duplicate, burst: int64(envInt("LOSS_BURST", 1)), budget: int64(envInt("QUEUE_BYTES", 65536)), space: make(chan struct{}), direction: "up"}
+	b := &carrier{in: up, out: down, done: make(chan struct{}), rate: downRate, delay: delay, start: started, profile: os.Getenv("PROFILE"), loss: loss, duplicate: duplicate, burst: int64(envInt("LOSS_BURST", 1)), budget: int64(envInt("QUEUE_BYTES", 65536)), space: make(chan struct{}), direction: "down"}
+	if v := os.Getenv("UP_PROFILE"); v != "" {
+		a.profile = v
+	}
+	if v := os.Getenv("DOWN_PROFILE"); v != "" {
+		b.profile = v
+	}
+	return a, b
+}
+
+func testTLS(t *testing.T) (*tls.Config, *tls.Config) {
+	t.Helper()
+	private := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{3}, ed25519.SeedSize))
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), DNSNames: []string{"t.example"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	der, err := x509.CreateCertificate(crand.Reader, template, template, private.Public(), private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(certificate)
+	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: private}}, MinVersion: tls.VersionTLS13}, &tls.Config{RootCAs: roots, ServerName: "t.example", MinVersion: tls.VersionTLS13}
+}
+
+func TestControlledTransfer(t *testing.T) {
+	a, b := makePair()
+	defer a.Close()
+	defer b.Close()
+	ln := &listener{ch: make(chan net.Conn, 10), done: make(chan struct{})}
+	defer ln.Close()
+	size := 65536
+	if v := os.Getenv("SIZE_MB"); v != "" {
+		n, _ := strconv.Atoi(v)
+		size *= n
+	}
+	if v := os.Getenv("SIZE_KB"); v != "" {
+		n, _ := strconv.Atoi(v)
+		size = n * 64
+	}
+	data := payloadFor(0, size*16)
+	key := bytes.Repeat([]byte{7}, 32)
+	var serverTLS, clientTLS *tls.Config
+	if os.Getenv("TLS") == "1" {
+		serverTLS, clientTLS = testTLS(t)
+	}
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- server.Start(b, key, func(string, string) (net.Conn, error) {
+			x, y := net.Pipe()
+			go func() {
+				defer y.Close()
+				y.SetDeadline(time.Now().Add(60 * time.Second))
+				if serverTLS != nil {
+					y = tls.Server(y, serverTLS)
+				}
+				mode := make([]byte, 2)
+				if _, e := io.ReadFull(y, mode); e != nil {
+					return
+				}
+				data := payloadFor(int(mode[1]), len(data))
+				if mode[0] == 'D' || mode[0] == 'T' {
+					payload := data
+					if mode[0] == 'T' {
+						payload = data[:32]
+					}
+					y.Write(payload)
+					io.ReadFull(y, make([]byte, 1))
+				} else {
+					buf := make([]byte, len(data))
+					_, e := io.ReadFull(y, buf)
+					if e == nil && bytes.Equal(buf, data) {
+						y.Write([]byte{1})
+					}
+					io.ReadFull(y, make([]byte, 1))
+				}
+			}()
+			return half{x}, nil
+		})
+	}()
+	mtu := 500
+	if v := os.Getenv("MTU"); v != "" {
+		mtu, _ = strconv.Atoi(v)
+	}
+	clientDone := make(chan error, 1)
+	go func() {
+		clientDone <- client.Start(a, ln, noise.PubkeyFromPrivkey(key), mtu, os.Getenv("BBR") == "1", os.Getenv("FAIR") == "1")
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+		a.Close()
+		b.Close()
+		for name, ch := range map[string]<-chan error{"client": clientDone, "server": serverDone} {
+			select {
+			case <-ch:
+			case <-time.After(3 * time.Second):
+				t.Errorf("%s shutdown stuck", name)
+			}
+		}
+	})
+	modes := "DUD"
+	if v := os.Getenv("MODES"); v != "" {
+		modes = v
+	}
+	var metricsMu sync.Mutex
+	var tinyTimes []float64
+	var totalBytes int
+	bulkStart := time.Now()
+	transfer := func(index int, mode byte) {
+		if mode != 'T' {
+			time.Sleep(time.Duration(envInt("IDLE_MS", 0)) * time.Millisecond)
+		}
+		if mode == 'T' {
+			time.Sleep(time.Duration(envInt("INTERACTIVE_DELAY_MS", 0)) * time.Millisecond)
+		}
+		data := payloadFor(index, len(data))
+		x, y := net.Pipe()
+		ln.ch <- half{x}
+		y.SetDeadline(time.Now().Add(60 * time.Second))
+		if clientTLS != nil {
+			y = tls.Client(y, clientTLS)
+		}
+		start := time.Now()
+		_, err := y.Write([]byte{mode, byte(index)})
+		n := 0
+		if err == nil {
+			if mode == 'D' || mode == 'T' {
+				expected := data
+				if mode == 'T' {
+					expected = data[:32]
+				}
+				buf := make([]byte, len(expected))
+				if delayMS := envInt("RECEIVER_DELAY_MS", 0); delayMS > 0 && mode == 'D' {
+					for n < len(buf) && err == nil {
+						end := min(n+4096, len(buf))
+						var k int
+						k, err = io.ReadFull(y, buf[n:end])
+						n += k
+						time.Sleep(time.Duration(delayMS) * time.Millisecond)
+					}
+				} else {
+					n, err = io.ReadFull(y, buf)
+				}
+				if err == nil && !bytes.Equal(buf, expected) {
+					err = fmt.Errorf("integrity failure")
+				}
+			} else {
+				n, err = y.Write(data)
+				if err == nil {
+					ack := make([]byte, 1)
+					_, err = io.ReadFull(y, ack)
+					if err == nil && ack[0] != 1 {
+						err = fmt.Errorf("integrity failure")
+					}
+				}
+			}
+		}
+		elapsed := time.Since(start).Seconds()
+		metricsMu.Lock()
+		totalBytes += n
+		if mode == 'T' {
+			tinyTimes = append(tinyTimes, elapsed)
+		}
+		metricsMu.Unlock()
+		t.Logf("mode=%c bytes=%d seconds=%.3f Mbps=%.3f queries=%d responses=%d err=%v", mode, n, elapsed, float64(n)*8/elapsed/1e6, a.count.Load(), b.count.Load(), err)
+		t.Logf("server_dropped_replies=%d", server.Dropped())
+		threshold := ""
+		if mode == 'U' {
+			threshold = os.Getenv("MIN_UPLOAD_MBPS")
+			if index == len(modes)-1 && os.Getenv("MIN_FINAL_UPLOAD_MBPS") != "" {
+				threshold = os.Getenv("MIN_FINAL_UPLOAD_MBPS")
+			}
+		}
+		if mode == 'D' && index == len(modes)-1 {
+			threshold = os.Getenv("MIN_POST_MBPS")
+		}
+		if threshold != "" {
+			minimum, _ := strconv.ParseFloat(threshold, 64)
+			if got := float64(n) * 8 / elapsed / 1e6; got < minimum {
+				t.Errorf("throughput regression: %c %.3f Mbps < %.3f Mbps", mode, got, minimum)
+			}
+		}
+		if err == nil {
+			y.Write([]byte{1})
+		}
+		y.Close()
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	if os.Getenv("CONCURRENT") == "1" {
+		var wg sync.WaitGroup
+		for index, mode := range []byte(modes) {
+			wg.Add(1)
+			go func(i int, m byte) { defer wg.Done(); transfer(i, m) }(index, mode)
+		}
+		wg.Wait()
+	} else {
+		until := time.Now().Add(time.Duration(envInt("SOAK_SECONDS", 0)) * time.Second)
+		for cycle := 0; ; cycle++ {
+			for index, mode := range []byte(modes) {
+				transfer((cycle*len(modes)+index)%256, mode)
+			}
+			if time.Now().After(until) {
+				break
+			}
+		}
+	}
+	elapsed := time.Since(bulkStart).Seconds()
+	sort.Float64s(tinyTimes)
+	p50, p95 := 0.0, 0.0
+	if len(tinyTimes) > 0 {
+		p50 = tinyTimes[(len(tinyTimes)-1)/2]
+		p95 = tinyTimes[int(float64(len(tinyTimes)-1)*0.95)]
+	}
+	t.Logf("summary bytes=%d seconds=%.3f aggregate_Mbps=%.3f tiny_p50_ms=%.1f tiny_p95_ms=%.1f wire_up=%d wire_down=%d peak_up=%d peak_down=%d", totalBytes, elapsed, float64(totalBytes)*8/elapsed/1e6, p50*1000, p95*1000, a.wire.Load(), b.wire.Load(), a.peak.Load(), b.peak.Load())
+	if maxMS := envInt("MAX_TINY_P95_MS", 0); maxMS > 0 && p95*1000 > float64(maxMS) {
+		t.Errorf("interactive latency regression %.1f > %d ms", p95*1000, maxMS)
+	}
+	if a.peak.Load() > a.budget || b.peak.Load() > b.budget {
+		t.Error("queue budget exceeded")
+	}
+	if server.Dropped() != 0 {
+		t.Errorf("reliable carrier discarded %d replies", server.Dropped())
+	}
+}
+
+// Raw carrier baseline excludes DNS/KCP/Noise/smux. It is a capacity reference,
+// not a claim about kernel TCP or the direct WAN connection.
+func TestRawCarrier(t *testing.T) {
+	if os.Getenv("LOSS_EVERY") != "" || os.Getenv("DUP_EVERY") != "" {
+		t.Skip("raw carrier has no record-loss recovery")
+	}
+	a, b := makePair()
+	defer a.Close()
+	defer b.Close()
+	size := envInt("SIZE_MB", 1) * 1024 * 1024
+	if os.Getenv("SIZE_KB") != "" {
+		size = envInt("SIZE_KB", 64) * 1024
+	}
+	expected := payloadFor(99, size)
+	for _, mode := range "DUD" {
+		from, to := b, a
+		chunk := 16000 // DNS response bundle-sized raw reference, not physical line capacity.
+		if mode == 'U' {
+			from, to = a, b
+			chunk = envInt("MTU", 500)
+		}
+		start := time.Now()
+		done := make(chan error, 1)
+		go func() {
+			for at := 0; at < len(expected); at += chunk {
+				_, e := from.WriteTo(expected[at:min(at+chunk, len(expected))], turbotunnel.DummyAddr{})
+				if e != nil {
+					done <- e
+					return
+				}
+			}
+			done <- nil
+		}()
+		got := make([]byte, 0, size)
+		buf := make([]byte, 65535)
+		for len(got) < size {
+			n, _, e := to.ReadFrom(buf)
+			if e != nil {
+				t.Fatal(e)
+			}
+			got = append(got, buf[:n]...)
+		}
+		if e := <-done; e != nil {
+			t.Fatal(e)
+		}
+		if !bytes.Equal(got, expected) {
+			t.Fatal("raw carrier corrupted payload")
+		}
+		elapsed := time.Since(start).Seconds()
+		t.Logf("raw mode=%c bytes=%d seconds=%.3f Mbps=%.3f", mode, size, elapsed, float64(size)*8/elapsed/1e6)
+	}
+}
+
+func TestCarrierBoundedQueueAndClose(t *testing.T) {
+	up, down := make(chan packet, 2), make(chan packet, 2)
+	c := &carrier{in: up, out: down, done: make(chan struct{}), space: make(chan struct{}), rate: 1000, budget: 4, start: time.Now()}
+	if _, err := c.WriteTo([]byte{1, 2}, nil); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := c.WriteTo([]byte{3, 4}, nil); done <- err }()
+	select {
+	case <-done:
+		t.Fatal("full queue did not backpressure")
+	case <-time.After(10 * time.Millisecond):
+	}
+	c.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("closed queue accepted blocked write")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not release writer")
+	}
+	if c.peak.Load() > 4 {
+		t.Fatal("queue exceeded byte budget")
+	}
+}
+
+func TestCarrierOrderedHOLStall(t *testing.T) {
+	wire := make(chan packet, 4)
+	c := &carrier{in: wire, out: wire, done: make(chan struct{}), space: make(chan struct{}), rate: 1000000, budget: 4096, start: time.Now(), profile: "tcp-loss"}
+	defer c.Close()
+	c.count.Store(36)
+	started := time.Now()
+	c.WriteTo([]byte{1}, nil)
+	c.WriteTo([]byte{2}, nil)
+	buf := make([]byte, 10)
+	for _, want := range []byte{1, 2} {
+		n, _, e := c.ReadFrom(buf)
+		if e != nil || n != 1 || buf[0] != want {
+			t.Fatalf("HOL reordered data: %v %x", e, buf[:n])
+		}
+	}
+	if time.Since(started) < 200*time.Millisecond {
+		t.Fatal("TCP-loss model did not stall later delivery")
+	}
+}
+
+func TestCarrierRecordLossBurst(t *testing.T) {
+	wire := make(chan packet, 16)
+	c := &carrier{in: wire, out: wire, done: make(chan struct{}), space: make(chan struct{}), rate: 1000000, budget: 4096, start: time.Now(), loss: 5, burst: 2}
+	defer c.Close()
+	for n := byte(1); n <= 8; n++ {
+		c.WriteTo([]byte{n}, nil)
+	}
+	buf := make([]byte, 10)
+	for _, want := range []byte{1, 2, 3, 6, 7, 8} {
+		n, _, e := c.ReadFrom(buf)
+		if e != nil || n != 1 || buf[0] != want {
+			t.Fatalf("loss burst mismatch: %v %x want=%d", e, buf[:n], want)
+		}
+	}
+	if len(wire) != 0 {
+		t.Fatal("loss model retained dropped records")
+	}
+}

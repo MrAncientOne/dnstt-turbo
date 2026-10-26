@@ -1,0 +1,180 @@
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"runtime"
+	"testing"
+	"time"
+	"www.bamsoftware.com/git/dnstt.git/dns"
+	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+)
+
+// Drives wire decoding -> response admission -> real response scheduler.
+// No KCP/Noise handshake or data packet is supplied.
+func TestAuditUnauthenticatedClientIDAllocation(t *testing.T) {
+	oldQ, oldD := turbotunnel.GetQueueSize(), maxResponseDelay
+	defer turbotunnel.SetQueueSize(oldQ)
+	defer func() { maxResponseDelay = oldD }()
+	maxResponseDelay = 0
+	for _, qsize := range []int{128, 2 * kcpWindow} {
+		t.Run(fmt.Sprintf("queue_%d", qsize), func(t *testing.T) {
+			turbotunnel.SetQueueSize(qsize)
+			tt := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 0)
+			defer tt.Close()
+			const n = 8
+			fc := &fakePacketConn{raddr: fakeAddr2{}}
+			for i := 0; i < n; i++ {
+				var cid turbotunnel.ClientID
+				binary.LittleEndian.PutUint64(cid[:], uint64(i+1))
+				q := testQuery(t, testDomain(t), uint16(i), clientPayload(cid), 4096)
+				wire, err := q.WireFormat()
+				if err != nil {
+					t.Fatal(err)
+				}
+				fc.reads = append(fc.reads, wire)
+			}
+			ch := make(chan *record, n)
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			_ = recvLoop(testDomain(t), fc, tt, ch, 16384)
+			close(ch)
+			if err := sendLoop(fc, tt, ch, 16384, computeMaxEncodedPayload(16384)); err != nil {
+				t.Fatal(err)
+			}
+			runtime.GC()
+			runtime.ReadMemStats(&after)
+			runtime.KeepAlive(tt)
+			if len(fc.writes) != n {
+				t.Fatalf("wrote %d responses, want %d", len(fc.writes), n)
+			}
+			retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+			t.Logf("queue=%d eight unauthenticated poll IDs retained=%d bytes", qsize, retained)
+			if retained > 2*1024*1024 {
+				t.Errorf("eight empty polls retained %d bytes (>2MiB), with queue=%d", retained, qsize)
+			}
+		})
+	}
+}
+
+// A TCP receiver that does not drain replies must not block responses for a
+// separate healthy TCP client. Uses the actual global server send loop.
+func TestAuditSlowTCPReaderDoesNotBlockOtherClient(t *testing.T) {
+	slowClient, slowServer := net.Pipe()
+	fastClient, fastServer := net.Pipe()
+	defer slowClient.Close()
+	defer slowServer.Close()
+	defer fastClient.Close()
+	defer fastServer.Close()
+	slowAddr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 10001}
+	fastAddr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 10002}
+	c := &TCPServerPacketConn{conns: map[string]net.Conn{slowAddr.String(): slowServer, fastAddr.String(): fastServer}, closed: make(chan struct{})}
+	defer c.Close()
+	tt := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 0)
+	defer tt.Close()
+	ch := make(chan *record, 2)
+	for _, addr := range []net.Addr{slowAddr, fastAddr} {
+		ch <- &record{Resp: &dns.Message{ID: 1, Flags: 0x8001}, Addr: addr, Advertised: 4096}
+	}
+	close(ch)
+	done := make(chan error, 1)
+	go func() { done <- sendLoop(c, tt, ch, 16384, computeMaxEncodedPayload(16384)) }()
+	got := make(chan error, 1)
+	go func() {
+		var b [2]byte
+		_, err := io.ReadFull(fastClient, b[:])
+		if err == nil {
+			_, err = io.CopyN(io.Discard, fastClient, int64(binary.BigEndian.Uint16(b[:])))
+		}
+		got <- err
+	}()
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("healthy client's response blocked behind unrelated non-reading TCP client; default write deadline is 30s")
+	}
+	slowClient.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Error("send loop did not exit after slow peer released")
+	}
+}
+
+func TestAuditAcceptedSmallResponseCapCanCarryConfiguredSegment(t *testing.T) {
+	oldQ, oldD := turbotunnel.GetQueueSize(), maxResponseDelay
+	defer turbotunnel.SetQueueSize(oldQ)
+	defer func() { maxResponseDelay = oldD }()
+	turbotunnel.SetQueueSize(128)
+	maxResponseDelay = 0
+	const serverMax = 16384
+	mtu := computeMaxEncodedPayload(serverMax) - 2
+	if mtu > kcpMTUCap {
+		mtu = kcpMTUCap
+	}
+	for _, adv := range []int{4096, 1232, 512} {
+		t.Run(fmt.Sprintf("advertised_%d", adv), func(t *testing.T) {
+			tt := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 0)
+			defer tt.Close()
+			var cid turbotunnel.ClientID
+			cid[0] = 1
+			// This is the segment size run()/acceptSessions configures, not an
+			// oversized packet bypassing its configuration.
+			pkt := make([]byte, mtu)
+			binary.LittleEndian.PutUint32(pkt[:4], 1)
+			pkt[4] = 81
+			binary.LittleEndian.PutUint32(pkt[20:24], uint32(len(pkt)-24))
+			_, err := tt.WriteTo(pkt, cid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			q := testQuery(t, testDomain(t), 1, clientPayload(cid), uint16(adv))
+			resp, _, advertised := responseFor(q, testDomain(t), serverMax)
+			if adv < minimumResponseCap(serverMax) {
+				if resp.Rcode() != dns.RcodeFormatError {
+					t.Fatal("unsupported response size was accepted")
+				}
+				// Rejection must be a valid complete DNS error, not sliced TXT.
+				wire, err := resp.WireFormat()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = dns.MessageFromWireFormat(wire); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if resp.Rcode() != 0 {
+				t.Fatal("supported query was rejected")
+			}
+			ch := make(chan *record, 1)
+			ch <- &record{Resp: resp, Addr: fakeAddr2{}, ClientID: cid, Advertised: advertised}
+			close(ch)
+			fc := &fakePacketConn{raddr: fakeAddr2{}}
+			if err := sendLoop(fc, tt, ch, serverMax, computeMaxEncodedPayload(serverMax)); err != nil {
+				t.Fatal(err)
+			}
+			if len(fc.writes) != 1 {
+				t.Fatalf("responses=%d", len(fc.writes))
+			}
+			t.Logf("configured KCP MTU=%d advertised=%d wire=%d TC=%t", mtu, adv, len(fc.writes[0]), fc.writes[0][2]&2 != 0)
+			got, err := dns.MessageFromWireFormat(fc.writes[0])
+			if err != nil {
+				t.Fatalf("accepted query got truncated unparseable response: %v", err)
+			}
+			payload, err := dns.DecodeRDataTXT(got.Answer[0].Data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(payload) != mtu+2 {
+				t.Fatalf("segment payload=%d want=%d", len(payload), mtu+2)
+			}
+		})
+	}
+}
